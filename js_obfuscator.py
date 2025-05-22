@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import shutil
 import argparse
+import re
 from pathlib import Path
 
 
@@ -103,8 +104,59 @@ class JSObfuscator:
         opts.indent_size = 2
         return jsbeautifier.beautify(js_code, opts)
     
-    def obfuscate_js(self, js_code):
+    def is_browser_extension_background(self, file_path, js_code):
+        """判断是否为浏览器扩展的background.js文件"""
+        file_name = os.path.basename(file_path).lower()
+        
+        # 检查文件名是否为background.js
+        if file_name == "background.js":
+            # 检查代码中是否包含浏览器扩展API的特征
+            extension_apis = [
+                "chrome\\.runtime", "chrome\\.tabs", "chrome\\.storage",
+                "browser\\.runtime", "browser\\.tabs", "browser\\.storage",
+                "chrome\\.contextMenus", "browser\\.contextMenus",
+                "chrome\\.webRequest", "browser\\.webRequest",
+                "chrome\\.extension", "browser\\.extension"
+            ]
+            
+            for api in extension_apis:
+                if re.search(api, js_code):
+                    return True
+        
+        return False
+    
+    def get_obfuscation_options_for_file(self, file_path, js_code):
+        """根据文件类型获取适合的混淆选项"""
+        options = self.options.copy()
+        
+        # 检查是否为浏览器扩展的background.js
+        if self.is_browser_extension_background(file_path, js_code):
+            print(f"检测到浏览器扩展的background.js文件: {file_path}")
+            print("使用特殊混淆选项，避免使用window对象")
+            
+            # 为background.js设置特殊选项
+            options.update({
+                "target": "browser",  # 设置目标环境为浏览器
+                "browserify": False,  # 不使用browserify
+                "domainLock": [],     # 不使用域名锁定
+                "selfDefending": False,  # 禁用自我保护，可能会导致问题
+                "stringArray": True,
+                "stringArrayCallsTransform": False,  # 不转换字符串数组调用
+                "stringArrayWrappersCount": 1,
+                "stringArrayWrappersType": "variable",
+                "stringArrayThreshold": 0.75,
+                "transformObjectKeys": False,  # 不转换对象键，避免API调用问题
+            })
+        
+        return options
+    
+    def obfuscate_js(self, js_code, file_path=None):
         """混淆单个JS代码字符串"""
+        # 获取适合该文件的混淆选项
+        options = self.options
+        if file_path:
+            options = self.get_obfuscation_options_for_file(file_path, js_code)
+        
         # 创建临时文件
         with tempfile.NamedTemporaryFile(suffix='.js', delete=False) as temp_in:
             temp_in.write(js_code.encode('utf-8'))
@@ -116,7 +168,7 @@ class JSObfuscator:
         # 创建配置文件
         config_path = tempfile.mktemp(suffix='.json')
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(self.options, f)
+            json.dump(options, f)
             
         try:
             # 执行混淆
@@ -130,6 +182,11 @@ class JSObfuscator:
             # 读取混淆后的代码
             with open(temp_out_path, 'r', encoding='utf-8') as f:
                 obfuscated_code = f.read()
+            
+            # 如果是background.js文件，进行额外处理
+            if file_path and self.is_browser_extension_background(file_path, js_code):
+                # 替换可能导致问题的全局引用
+                obfuscated_code = self._fix_background_js_code(obfuscated_code)
                 
             return obfuscated_code
         
@@ -141,6 +198,20 @@ class JSObfuscator:
                 except:
                     pass
     
+    def _fix_background_js_code(self, code):
+        """修复background.js混淆后的代码，替换window引用"""
+        # 替换直接的window引用
+        code = re.sub(r'(?<!\w)window(?!\w)', 'self', code)
+        
+        # 添加安全检查，确保代码在扩展环境中正常运行
+        safe_header = """
+// 浏览器扩展环境适配
+var globalThis = globalThis || self || window || {};
+if (typeof window === 'undefined') { var window = self || globalThis; }
+
+"""
+        return safe_header + code
+    
     def obfuscate_file(self, input_file, output_file=None):
         """混淆单个JS文件"""
         if not output_file:
@@ -150,7 +221,7 @@ class JSObfuscator:
             with open(input_file, 'r', encoding='utf-8') as f:
                 js_code = f.read()
                 
-            obfuscated_code = self.obfuscate_js(js_code)
+            obfuscated_code = self.obfuscate_js(js_code, input_file)
             
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(obfuscated_code)
@@ -160,8 +231,15 @@ class JSObfuscator:
             print(f"混淆文件 {input_file} 时出错: {str(e)}")
             return False
     
-    def obfuscate_directory(self, input_dir, output_dir=None, recursive=True):
-        """混淆目录中的所有JS文件"""
+    def obfuscate_directory(self, input_dir, output_dir=None, recursive=True, copy_non_js=True):
+        """混淆目录中的所有JS文件，并可选择复制非JS文件
+        
+        Args:
+            input_dir: 输入目录
+            output_dir: 输出目录（默认与输入目录相同）
+            recursive: 是否递归处理子目录
+            copy_non_js: 是否复制非JS文件到输出目录
+        """
         input_dir = Path(input_dir)
         
         if not output_dir:
@@ -171,22 +249,38 @@ class JSObfuscator:
             if not output_dir.exists():
                 output_dir.mkdir(parents=True)
         
-        # 获取所有JS文件
+        # 获取所有文件
+        all_files = []
         js_files = []
+        non_js_files = []
+        
         if recursive:
             for root, _, files in os.walk(input_dir):
                 for file in files:
+                    file_path = Path(root) / file
                     if file.endswith('.js'):
-                        js_files.append(Path(root) / file)
+                        js_files.append(file_path)
+                    elif copy_non_js:
+                        non_js_files.append(file_path)
         else:
-            js_files = list(input_dir.glob('*.js'))
+            for file_path in input_dir.glob('*'):
+                if file_path.is_file():
+                    if file_path.suffix == '.js':
+                        js_files.append(file_path)
+                    elif copy_non_js:
+                        non_js_files.append(file_path)
             
-        total_files = len(js_files)
+        total_js_files = len(js_files)
+        total_non_js_files = len(non_js_files)
         processed_files = 0
         success_files = 0
+        copied_files = 0
         
-        print(f"找到 {total_files} 个JS文件需要混淆")
+        print(f"找到 {total_js_files} 个JS文件需要混淆")
+        if copy_non_js:
+            print(f"找到 {total_non_js_files} 个非JS文件需要复制")
         
+        # 处理JS文件
         for js_file in js_files:
             rel_path = js_file.relative_to(input_dir)
             out_file = output_dir / rel_path
@@ -195,13 +289,31 @@ class JSObfuscator:
             out_file.parent.mkdir(parents=True, exist_ok=True)
             
             processed_files += 1
-            print(f"[{processed_files}/{total_files}] 正在混淆: {rel_path}")
+            print(f"[{processed_files}/{total_js_files}] 正在混淆: {rel_path}")
             
             if self.obfuscate_file(str(js_file), str(out_file)):
                 success_files += 1
+        
+        # 复制非JS文件
+        if copy_non_js and non_js_files:
+            print(f"开始复制非JS文件...")
+            for non_js_file in non_js_files:
+                rel_path = non_js_file.relative_to(input_dir)
+                out_file = output_dir / rel_path
                 
-        print(f"混淆完成: {success_files}/{total_files} 个文件成功混淆")
-        return success_files, total_files
+                # 确保输出目录存在
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    shutil.copy2(non_js_file, out_file)
+                    copied_files += 1
+                except Exception as e:
+                    print(f"复制文件 {non_js_file} 时出错: {str(e)}")
+            
+            print(f"复制完成: {copied_files}/{total_non_js_files} 个非JS文件成功复制")
+                
+        print(f"混淆完成: {success_files}/{total_js_files} 个JS文件成功混淆")
+        return success_files, total_js_files, copied_files, total_non_js_files
 
 
 def main():
@@ -210,6 +322,7 @@ def main():
     parser.add_argument('-o', '--output', help='输出JS文件或目录 (默认覆盖输入)')
     parser.add_argument('-r', '--recursive', action='store_true', help='递归处理子目录')
     parser.add_argument('-c', '--config', help='混淆配置文件 (JSON格式)')
+    parser.add_argument('--no-copy', action='store_true', help='不复制非JS文件')
     
     args = parser.parse_args()
     
@@ -241,7 +354,8 @@ def main():
             return 0 if success else 1
         else:
             output_dir = args.output if args.output else args.input
-            obfuscator.obfuscate_directory(args.input, output_dir, args.recursive)
+            copy_non_js = not args.no_copy
+            obfuscator.obfuscate_directory(args.input, output_dir, args.recursive, copy_non_js)
             return 0
     except Exception as e:
         print(f"错误: {str(e)}")
