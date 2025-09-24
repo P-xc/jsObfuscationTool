@@ -11,12 +11,135 @@ import shutil
 import argparse
 import re
 from pathlib import Path
+import configparser
+from typing import Dict, Any, Optional, Union
 
 
 class JSObfuscator:
-    def __init__(self, options=None):
-        """初始化JavaScript混淆器"""
-        self.default_options = {
+    def __init__(self, options: Optional[Dict[str, Any]] = None, config_file: Optional[str] = None, config_section: str = "DEFAULT"):
+        """
+        JavaScript 混淆器
+        
+        Args:
+            options: 混淆选项字典
+            config_file: INI配置文件路径（可选）
+            config_section: 配置文件中使用的section名称（默认：DEFAULT）
+        """
+        # 加载配置
+        self.config = self._load_config(config_file, config_section)
+        
+        # 合并用户提供的选项
+        if options:
+            self._merge_options(self.config, options)
+        
+        self.options = self.config
+        
+        # 检查Node.js是否已安装
+        if not self._check_nodejs_installed():
+            raise RuntimeError("未检测到Node.js。请先安装Node.js: https://nodejs.org/")
+            
+        # 检查是否安装了javascript-obfuscator
+        try:
+            self._run_npm_command(["npx", "javascript-obfuscator", "--version"])
+        except Exception:
+            print("正在安装javascript-obfuscator...")
+            try:
+                self._run_npm_command(["npm", "install", "-g", "javascript-obfuscator"])
+            except Exception as e:
+                raise RuntimeError(f"安装javascript-obfuscator失败: {str(e)}。请手动运行: npm install -g javascript-obfuscator")
+    
+    def _merge_options(self, target, source):
+        """递归合并选项字典"""
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                self._merge_options(target[key], value)
+            else:
+                target[key] = value
+        
+        # 确保如果启用了debugProtection但没有提供debugProtectionInterval，添加一个默认值
+        if target.get("debugProtection", False) and "debugProtectionInterval" not in target:
+            target["debugProtectionInterval"] = 1000
+            
+        # 如果禁用了debugProtection但提供了debugProtectionInterval，则移除它
+        if not target.get("debugProtection", False) and "debugProtectionInterval" in target:
+            del target["debugProtectionInterval"]
+
+    def _load_config(self, config_file: Optional[str] = None, config_section: str = "DEFAULT") -> Dict[str, Any]:
+        """
+        从INI配置文件加载混淆选项
+        
+        Args:
+            config_file: INI配置文件路径，如果为None则使用默认配置
+            config_section: 配置文件中使用的section名称
+            
+        Returns:
+            混淆选项字典
+        """
+        # 获取默认配置
+        config_dict = self._get_default_options()
+        
+        # 如果没有指定配置文件，返回默认配置
+        if not config_file:
+            return config_dict
+        
+        # 检查配置文件是否存在
+        config_path = Path(config_file)
+        if not config_path.exists():
+            print(f"⚠️  配置文件 {config_file} 不存在，使用默认配置")
+            return config_dict
+        
+        try:
+            # 读取INI配置文件
+            config_parser = configparser.ConfigParser()
+            config_parser.read(config_path, encoding='utf-8')
+            
+            # 检查指定的section是否存在
+            if config_section not in config_parser:
+                available_sections = list(config_parser.sections())
+                print(f"⚠️  配置section '{config_section}' 不存在，可用sections: {available_sections}")
+                print(f"使用默认配置")
+                return config_dict
+            
+            # 从指定section读取配置
+            section_config = config_parser[config_section]
+            
+            # 转换配置值为正确的类型
+            loaded_config = {}
+            for key, default_value in config_dict.items():
+                if key in section_config:
+                    config_value = section_config[key]
+                    # 根据默认值类型转换配置值
+                    if isinstance(default_value, bool):
+                        loaded_config[key] = config_value.lower() in ('true', '1', 'yes', 'on')
+                    elif isinstance(default_value, (int, float)):
+                        loaded_config[key] = type(default_value)(config_value)
+                    elif isinstance(default_value, list):
+                        # 处理列表类型（如stringArrayEncoding）
+                        if config_value.strip():
+                            loaded_config[key] = [item.strip() for item in config_value.split(',')]
+                        else:
+                            loaded_config[key] = []
+                    else:
+                        loaded_config[key] = config_value
+                else:
+                    loaded_config[key] = default_value
+            
+            print(f"✅ 成功从 {config_file}[{config_section}] 加载配置")
+            return loaded_config
+            
+        except Exception as e:
+            print(f"❌ 加载配置文件失败: {e}")
+            print("使用默认配置")
+            return config_dict
+      
+    def _get_default_options(self) -> Dict[str, Any]:
+        """
+        获取默认混淆选项
+        
+        Returns:
+            默认混淆选项字典
+        """
+        default_options = {
             "compact": True,
             "controlFlowFlattening": True,
             "controlFlowFlatteningThreshold": 0.7,
@@ -35,39 +158,15 @@ class JSObfuscator:
             "stringArray": True,
             "stringArrayEncoding": ["base64"],
             "stringArrayThreshold": 0.75,
-            "transformObjectKeys": True,
+            "transformObjectKeys": False,  # 默认禁用，避免对象属性访问问题
             "unicodeEscapeSequence": False
         }
         
         # 如果启用了debugProtection，则添加debugProtectionInterval选项
-        if self.default_options.get("debugProtection", False):
-            self.default_options["debugProtectionInterval"] = 1000  # 设置为1000毫秒
-        
-        self.options = self.default_options.copy()
-        if options:
-            # 确保如果用户提供的配置启用了debugProtection但没有提供debugProtectionInterval，添加一个默认值
-            if options.get("debugProtection", False) and "debugProtectionInterval" not in options:
-                options["debugProtectionInterval"] = 1000
-                
-            # 如果用户禁用了debugProtection但提供了debugProtectionInterval，则移除它
-            if not options.get("debugProtection", False) and "debugProtectionInterval" in options:
-                del options["debugProtectionInterval"]
-                
-            self.options.update(options)
+        if default_options.get("debugProtection", False):
+            default_options["debugProtectionInterval"] = 1000  # 设置为1000毫秒
             
-        # 检查Node.js是否已安装
-        if not self._check_nodejs_installed():
-            raise RuntimeError("未检测到Node.js。请先安装Node.js: https://nodejs.org/")
-            
-        # 检查是否安装了javascript-obfuscator
-        try:
-            self._run_npm_command(["npx", "javascript-obfuscator", "--version"])
-        except Exception:
-            print("正在安装javascript-obfuscator...")
-            try:
-                self._run_npm_command(["npm", "install", "-g", "javascript-obfuscator"])
-            except Exception as e:
-                raise RuntimeError(f"安装javascript-obfuscator失败: {str(e)}。请手动运行: npm install -g javascript-obfuscator")
+        return default_options
             
     def _check_nodejs_installed(self):
         """检查Node.js是否已安装"""
@@ -147,8 +246,84 @@ class JSObfuscator:
                 "stringArrayThreshold": 0.75,
                 "transformObjectKeys": False,  # 不转换对象键，避免API调用问题
             })
+        else:
+            # 对于其他JS文件，也检查是否需要禁用transformObjectKeys
+            if self._should_disable_transform_object_keys(js_code):
+                print(f"检测到代码中包含对象属性访问，禁用transformObjectKeys: {file_path}")
+                options["transformObjectKeys"] = False
         
         return options
+    
+    def _should_disable_transform_object_keys(self, js_code):
+        """
+        检查代码中是否包含需要保留对象键名的模式
+        
+        Args:
+            js_code (str): JavaScript代码
+            
+        Returns:
+            bool: 如果应该禁用transformObjectKeys则返回True
+        """
+        # 检查常见的对象属性访问模式
+        patterns = [
+            r'\w+\.\w+',           # obj.prop
+            r'\w+\[\s*[\'"`]\w+[\'"`]\s*\]',  # obj['prop'] 或 obj["prop"]
+            r'console\.',           # console对象
+            r'window\.',            # window对象
+            r'document\.',          # document对象
+            r'localStorage\.',      # localStorage
+            r'sessionStorage\.',    # sessionStorage
+            r'location\.',         # location对象
+            r'navigator\.',         # navigator对象
+            r'fetch\(',             # fetch API
+            r'XMLHttpRequest',      # XMLHttpRequest
+            r'addEventListener',    # 事件监听
+            r'removeEventListener',  # 移除事件监听
+            r'querySelector',       # DOM选择器
+            r'querySelectorAll',    # DOM选择器全部
+            r'getElementById',      # 通过ID获取元素
+            r'getElementsBy',      # 通过其他方式获取元素
+            r'createElement',       # 创建元素
+            r'appendChild',         # 添加子元素
+            r'removeChild',          # 移除子元素
+            r'setAttribute',        # 设置属性
+            r'getAttribute',        # 获取属性
+            r'style\.',              # style属性
+            r'classList\.',         # classList属性
+            r'innerHTML',           # innerHTML
+            r'innerText',           # innerText
+            r'textContent',         # textContent
+            r'value',               # input值
+            r'addEventListener',    # 事件监听
+            r'setTimeout',          # 定时器
+            r'setInterval',         # 间隔定时器
+            r'clearTimeout',        # 清除定时器
+            r'clearInterval',       # 清除间隔定时器
+            r'Promise',             # Promise
+            r'async\s+function',     # async函数
+            r'await\s+',            # await关键字
+            r'try\s*{',              # try块
+            r'catch\s*\(',           # catch块
+            r'finally\s*{',         # finally块
+            r'throw\s+',             # throw语句
+            r'JSON\.',               # JSON对象
+            r'Math\.',               # Math对象
+            r'Date\.',               # Date对象
+            r'Array\.',              # Array对象
+            r'Object\.',             # Object对象
+            r'String\.',             # String对象
+            r'Number\.',             # Number对象
+            r'Boolean\.',            # Boolean对象
+            r'RegExp\.',             # RegExp对象
+            r'Error\.',              # Error对象
+        ]
+        
+        import re
+        for pattern in patterns:
+            if re.search(pattern, js_code, re.IGNORECASE):
+                return True
+        
+        return False
     
     def obfuscate_js(self, js_code, file_path=None):
         """混淆单个JS代码字符串"""
@@ -171,13 +346,14 @@ class JSObfuscator:
             json.dump(options, f)
             
         try:
-            # 执行混淆
+            # 构建javascript-obfuscator命令
             cmd = ["npx", "javascript-obfuscator", 
                   temp_in_path, 
                   "--output", temp_out_path,
                   "--config", config_path]
             
-            self._run_npm_command(cmd)
+            # 执行混淆命令 - 使用shell=True在Windows上更可靠
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
             
             # 读取混淆后的代码
             with open(temp_out_path, 'r', encoding='utf-8') as f:
@@ -190,13 +366,22 @@ class JSObfuscator:
                 
             return obfuscated_code
         
-        finally:
+        except subprocess.CalledProcessError as e:
             # 清理临时文件
             for path in [temp_in_path, temp_out_path, config_path]:
                 try:
                     os.unlink(path)
                 except:
                     pass
+            raise RuntimeError(f"JavaScript混淆失败: {e.stderr}")
+        except Exception as e:
+            # 清理临时文件
+            for path in [temp_in_path, temp_out_path, config_path]:
+                try:
+                    os.unlink(path)
+                except:
+                    pass
+            raise RuntimeError(f"JavaScript混淆失败: {str(e)}")
     
     def _fix_background_js_code(self, code):
         """修复background.js混淆后的代码，替换window引用"""
@@ -363,4 +548,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main()) 
+    sys.exit(main())
